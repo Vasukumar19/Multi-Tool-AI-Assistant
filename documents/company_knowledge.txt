@@ -1,0 +1,37 @@
+Company Knowledge Base
+========================
+
+## About the Company
+TechCorp is a software company founded in 2020 that specializes in AI-powered solutions.
+Our headquarters is in Bangalore, India with offices in San Francisco and London.
+
+## Products
+1. SmartChat - An AI-powered customer support chatbot
+2. DataSense - A real-time data analytics platform
+3. VisionAI - Computer vision solution for manufacturing quality control
+
+## Refund Policy
+Customers can request a full refund within 30 days of purchase.
+After 30 days, partial refunds are provided at 50% of the original price.
+No refunds are provided after 90 days from the date of purchase.
+
+## Pricing
+- SmartChat Basic: $49/month
+- SmartChat Pro: $149/month
+- DataSense Starter: $99/month
+- DataSense Enterprise: $499/month
+- VisionAI: Custom pricing based on usage
+
+## Support
+Support is available Monday to Friday, 9 AM to 6 PM IST.
+Email: support@techcorp.ai
+Phone: +91-80-1234-5678
+
+## Q1 2026 Revenue Report Summary
+Total Revenue: $2.4 million
+- SmartChat contributed 45% of revenue
+- DataSense contributed 35% of revenue
+- VisionAI contributed 20% of revenue
+Growth rate: 32% compared to Q1 2025
+New customers acquired: 148
+Customer retention rate: 91%
