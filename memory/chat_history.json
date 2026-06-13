@@ -70,5 +70,13 @@
     {
         "role": "assistant",
         "content": "Agent stopped due to iteration limit or time limit."
+    },
+    {
+        "role": "user",
+        "content": "hello"
+    },
+    {
+        "role": "assistant",
+        "content": "Hello. It's nice to meet you. Is there something I can help you with or would you like to chat?"
     }
 ]

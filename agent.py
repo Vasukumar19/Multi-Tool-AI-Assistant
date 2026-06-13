@@ -1,134 +1,923 @@
-"""
-Single Tool Agent
-=================
-Flow: Question -> Agent -> Web Search -> LLM -> Answer
-
-- LLM     : Groq (llama-3.3-70b-versatile) -- free tier, very fast
-- Tool    : DuckDuckGo Search              -- free, no API key needed
-- Agent   : LangChain ReAct Agent          -- create_react_agent + AgentExecutor
-"""
-
+from pathlib import Path
+from langchain_huggingface import (HuggingFaceEmbeddings)
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.tools import tool
 from langchain_classic.agents import create_react_agent, AgentExecutor
 from langchain_classic.prompts import PromptTemplate
+# RAG imports
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, DirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from datetime import datetime
+import json
 
-# -- Load environment variables ------------------------------------------------
+
+
+
+CHAT_HISTORY_FILE = Path("memory/chat_history.json")
+
+
+def load_chat_history():
+
+    if not CHAT_HISTORY_FILE.exists():
+        return []
+
+    try:
+        with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    except Exception:
+        return []
+    
+def save_chat_history(history):
+
+    CHAT_HISTORY_FILE.parent.mkdir(exist_ok=True)
+
+    # Cap to last 100 entries to prevent unbounded growth (Problem 10)
+    history = history[-100:]
+
+    with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=4)
+    
+def update_chat_history(user_message, assistant_message):
+
+    history = load_chat_history()
+
+    history.append({
+        "role": "user",
+        "content": user_message
+    })
+
+    history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+
+    save_chat_history(history)
+def get_recent_history(limit=10):
+
+    history = load_chat_history()
+
+    return history[-limit:]
+def format_chat_history(history):
+
+    formatted = []
+
+    for msg in history:
+
+        role = msg["role"].capitalize()
+
+        formatted.append(
+            f"{role}: {msg['content']}"
+        )
+
+    return "\n".join(formatted)
+
+"""
+Multi Tool Agent
+================
+Flow: Question -> Agent -> [Web Search | Calculator | RAG Search] -> LLM -> Answer
+- LLM       : Groq (llama-3.3-70b-versatile) -- free tier, very fast
+- Tools     : 1. DuckDuckGo Search   -- current news & facts from the web
+              2. Calculator          -- math & arithmetic expressions
+              3. RAG Search          -- search your own PDF & text documents
+- Embeddings: HuggingFace all-MiniLM-L6-v2 (free, runs locally)
+- Vector DB : FAISS (local, no server needed)
+- Agent     : LangChain ReAct Agent (create_react_agent + AgentExecutor)
+"""
+
+# ---------------------------------------------------------------------------
+# Load environment variables
+# ---------------------------------------------------------------------------
 load_dotenv()
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise EnvironmentError(
         "GROQ_API_KEY not found. Please add it to your .env file.\n"
         "Get a free key at: https://console.groq.com"
     )
-
-# -- 1. LLM -- Groq Llama 3.3 70B (free tier, ultra fast) --------------------
+# ---------------------------------------------------------------------------
+# 1. LLM  --  Groq Llama 3.3 70B
+# ---------------------------------------------------------------------------
 llm = ChatGroq(
     model="llama-3.3-70b-versatile",
     groq_api_key=GROQ_API_KEY,
     temperature=0.3,
 )
+# ---------------------------------------------------------------------------
+# 1b. Router Prompt + Intent Classifier (Problem 1)
+# ---------------------------------------------------------------------------
+ROUTER_PROMPT = """You are an intent classifier. Classify the user message into EXACTLY one of these categories:
 
-# -- 2. Tool -- DuckDuckGo Search (free, no key needed) -----------------------
+simple        — greetings, small talk, one-word replies, thanks, bye
+memory        — user sharing personal info: goals, skills, projects, courses, preferences, profession
+tool          — needs search, calculator, rag, or documents but has NO reference to user's personal context or past
+personal_tool — needs tools AND references user's past, preferences, personal info, or history
+
+Rules:
+- Return ONLY one word: simple, memory, tool, or personal_tool
+- No explanation, no punctuation, no extra text
+
+Message: {message}
+Category:"""
+
+def classify_intent(question: str) -> str:
+    """Classify user intent into one of 4 routing categories (Problem 1)."""
+    prompt = ROUTER_PROMPT.format(message=question)
+    response = llm.invoke(prompt)
+    raw = response.content.strip().lower().split()[0] if response.content.strip() else ""
+    valid = {"simple", "memory", "tool", "personal_tool"}
+    intent = raw if raw in valid else "personal_tool"
+    print(f"  [Router] Raw='{raw}' → Intent='{intent}'")
+    print(f"  [Router] Raw='{raw}' -> Intent='{intent}'")
+    return intent
+
+# ---------------------------------------------------------------------------
+# 2. RAG Setup  --  FAISS + HuggingFace Embeddings
+# ---------------------------------------------------------------------------
+DOCS_DIR   = Path(__file__).parent / "documents"   # drop your files here
+FAISS_DIR  = Path(__file__).parent / "faiss_index" # saved index lives here
+DOCS_DIR.mkdir(exist_ok=True)
+# Single module-level embeddings instance — used everywhere (Problem 7)
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"},
+)
+def build_or_load_vectorstore() -> FAISS | None:
+    """
+    Loads PDF and text files from the `documents/` folder,
+    splits them into chunks, embeds with HuggingFace, and stores in FAISS.
+    On subsequent runs it reloads the saved index (fast).
+    Automatically rebuilds if new documents are detected (Problem 8).
+    Returns None if no documents are found.
+    """
+    # ── Auto-refresh: rebuild if any document is newer than the index (Problem 8) ─
+    if FAISS_DIR.exists():
+        doc_files = list(DOCS_DIR.glob("*.pdf")) + list(DOCS_DIR.glob("*.txt"))
+        if doc_files:
+            latest_doc_mtime = max(f.stat().st_mtime for f in doc_files)
+            index_ctime = FAISS_DIR.stat().st_ctime
+            if latest_doc_mtime > index_ctime:
+                import shutil
+                print("[RAG] New documents detected — rebuilding FAISS index...")
+                shutil.rmtree(str(FAISS_DIR))
+    # ── Try loading saved index first ────────────────────────────────────────
+    if FAISS_DIR.exists():
+        print("[RAG] Loading existing FAISS index...")
+        return FAISS.load_local(str(FAISS_DIR), embeddings,
+                                allow_dangerous_deserialization=True)
+    # ── Build fresh index from documents ────────────────────────────────────
+    docs = []
+    # Load PDFs
+    pdf_files = list(DOCS_DIR.glob("*.pdf"))
+    for pdf_path in pdf_files:
+        print(f"[RAG] Loading PDF: {pdf_path.name}")
+        loader = PyPDFLoader(str(pdf_path))
+        docs.extend(loader.load())
+    # Load text files
+    txt_files = list(DOCS_DIR.glob("*.txt"))
+    for txt_path in txt_files:
+        print(f"[RAG] Loading TXT: {txt_path.name}")
+        loader = TextLoader(str(txt_path), encoding="utf-8")
+        docs.extend(loader.load())
+    if not docs:
+        print("[RAG] No documents found in 'documents/' folder. RAG tool disabled.")
+        return None
+    # Split into chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.split_documents(docs)
+    print(f"[RAG] Created {len(chunks)} chunks from {len(docs)} pages.")
+    # Embed and store
+    print("[RAG] Building FAISS index (this may take a moment)...")
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    vectorstore.save_local(str(FAISS_DIR))
+    print("[RAG] FAISS index saved.")
+    return vectorstore
+# Build/load on startup
+vectorstore = build_or_load_vectorstore()
+
+
+
+
+# ---------------------------------------------------------------------------
+# 3. Tools
+# ---------------------------------------------------------------------------
+
+SEMANTIC_MEMORY_DIR = Path(
+    "memory/semantic_memory"
+)
+
+# Module-level FAISS cache for semantic memory (Problem 5)
+_semantic_memory_cache = None
+
+def load_semantic_memory():
+    """Load semantic memory from disk once and cache in memory (Problem 5)."""
+    global _semantic_memory_cache
+    if _semantic_memory_cache is not None:
+        return _semantic_memory_cache
+    if SEMANTIC_MEMORY_DIR.exists():
+        _semantic_memory_cache = FAISS.load_local(
+            str(SEMANTIC_MEMORY_DIR),
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        return _semantic_memory_cache
+    return None
+    
+def add_semantic_memory(text):
+    """Add a memory entry and update the in-memory cache (Problem 5)."""
+    global _semantic_memory_cache
+    vector_store = load_semantic_memory()
+
+    doc = Document(
+        page_content=text,
+        metadata={
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+    if vector_store is None:
+        vector_store = FAISS.from_documents(
+            [doc],
+            embeddings
+        )
+    else:
+        vector_store.add_documents([doc])
+    vector_store.save_local(str(SEMANTIC_MEMORY_DIR))
+    _semantic_memory_cache = vector_store  # Update in-memory cache (Problem 5)
+def search_semantic_memory(query, k=3):
+    vector_store = load_semantic_memory()
+    if vector_store is None:
+        return []
+    else:
+        results = vector_store.similarity_search(query, k=k)
+        return results
+
+
+MEMORY_FILE = Path("memory/memory.json")
+
+def load_memory():
+    """
+    Reads memory.json and returns a Python dictionary.
+    """
+
+    if not MEMORY_FILE.exists():
+        return {}
+
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    except Exception:
+        return {}
+
+
+def save_memory(memory: dict):
+    """
+    Saves dictionary to memory.json
+    """
+
+    MEMORY_FILE.parent.mkdir(exist_ok=True)
+
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(memory, f, indent=4)
+
+MEMORY_PROCESSOR_PROMPT = """
+Analyze the user's message.
+
+Return ONLY valid JSON.
+
+Schema:
+
+{
+  "profile_memory": {
+    "name": "",
+    "goal": "",
+    "profession": "",
+    "education": "",
+    "interests": [],
+    "favorite_technologies": [],
+    "preferences": []
+  },
+
+  "semantic_memories": []
+}
+
+Rules:
+
+Profile Memory:
+Store stable personal facts such as:
+- name
+- goal
+- profession
+- education
+- interests
+- favorite technologies
+- preferences
+
+Semantic Memories:
+Store important long-term memories such as:
+- projects completed
+- courses completed
+- skills learned
+- achievements
+- important experiences
+
+Do NOT store:
+- greetings
+- questions
+- temporary requests
+- casual conversation
+
+Examples:
+
+Message:
+My name is Vasu.
+
+Output:
+{
+  "profile_memory": {
+    "name":"Vasu"
+  },
+  "semantic_memories":[]
+}
+
+Message:
+I built a RAG project using LangChain.
+
+Output:
+{
+  "profile_memory": {},
+  "semantic_memories":[
+    "Built a RAG project using LangChain"
+  ]
+}
+
+Message:
+I completed Andrew Ng's ML course.
+
+Output:
+{
+  "profile_memory": {},
+  "semantic_memories":[
+    "Completed Andrew Ng's ML course"
+  ]
+}
+
+Message:
+My name is Vasu and I want to become an AI Engineer.
+
+Output:
+{
+  "profile_memory":{
+      "name":"Vasu",
+      "goal":"AI Engineer"
+  },
+  "semantic_memories":[]
+}
+
+Message:
+{message}
+"""
+def process_memory(message):
+
+    prompt = MEMORY_PROCESSOR_PROMPT.format(
+        message=message
+    )
+
+    response = llm.invoke(prompt)
+
+    try:
+        return json.loads(
+            response.content
+        )
+
+    except:
+        return {
+            "profile_memory": {},
+            "semantic_memories": []
+        }
+def update_memories(message):
+
+    memory_data = process_memory(
+        message
+    )
+
+    profile_memory = memory_data.get(
+        "profile_memory",
+        {}
+    )
+
+    semantic_memories = memory_data.get(
+        "semantic_memories",
+        []
+    )
+
+    # Update profile memory
+    if profile_memory:
+
+        memory = load_memory()
+
+        memory.update(
+            profile_memory
+        )
+
+        save_memory(memory)
+
+    # Update semantic memory
+    for memory_text in semantic_memories:
+
+        add_semantic_memory(
+            memory_text
+        )
+def get_profile_memory():
+
+    memory = load_memory()
+
+    if not memory:
+        return "No profile memory."
+
+    return json.dumps(
+        memory,
+        indent=2
+    )
+def get_history_context():
+
+    history = get_recent_history(
+        limit=10
+    )
+
+    if not history:
+        return "No conversation history."
+
+    return format_chat_history(
+        history
+    )
+def get_semantic_context(
+    question,
+    k=3
+):
+
+    results = search_semantic_memory(
+        question,
+        k=k
+    )
+
+    if not results:
+        return "No relevant semantic memories."
+
+    return "\n".join(
+        doc.page_content
+        for doc in results
+    )
+# Tool 1: DuckDuckGo Web Search
 search_tool = DuckDuckGoSearchRun(
     name="web_search",
     description=(
         "Search the web using DuckDuckGo. "
-        "Use this when you need current information, facts, news, or anything "
-        "that requires real-world knowledge beyond your training data. "
-        "Input should be a concise search query string."
+        "Use this for current events, news, general facts, or anything "
+        "that requires real-world knowledge. "
+        "Input: a concise search query string."
     ),
 )
-tools = [search_tool]
+# Tool 2: Calculator
+@tool
+def calculator(expression: str) -> str:
+    """
+    Evaluates arithmetic expressions: +, -, *, /, **, sqrt, etc.
+    Use this for any math or calculation question.
+    Examples: '2 + 2', '100 * 3.14', 'sqrt(144)', '2 ** 10'
+    """
+    try:
+        import math
+        allowed = {k: v for k, v in math.__dict__.items() if not k.startswith('_')}
+        result = eval(expression, {"__builtins__": {}}, allowed)
+        return str(result)
+    except Exception as e:
+        return f"Error evaluating '{expression}': {e}"
+   
+# Tool 3: RAG Search (real FAISS-backed implementation)
+@tool
+def rag_search(query: str) -> str:
+    """
+    Search through the company's uploaded PDF and text documents using semantic similarity.
+    ALWAYS use this tool first for questions about:
+    - Company policies (refund, return, cancellation, billing)
+    - Company products, pricing, or services
+    - Internal reports, revenue, financial data
+    - Support contacts, office locations, working hours
+    - Any question containing words like 'company', 'our', 'policy', 'report', 'document'
+    Examples: 'What is the refund policy?', 'What are the product prices?',
+              'Summarize the Q1 revenue report', 'How do I contact support?'
+    """
+    if vectorstore is None:
+        return (
+            "No documents found in the 'documents/' folder. "
+            "Please add PDF or .txt files there and restart the agent."
+        )
+    results = vectorstore.similarity_search(query, k=3)
+    if not results:
+        return "No relevant information found in the documents."
+    output = []
+    for i, doc in enumerate(results, 1):
+        source = doc.metadata.get("source", "unknown")
+        page   = doc.metadata.get("page", "")
+        label  = f"[Doc {i} | {Path(source).name}" + (f" p.{page+1}]" if page != "" else "]")
+        output.append(f"{label}\n{doc.page_content.strip()}")
+    return "\n\n".join(output)
 
-# -- 3. ReAct Prompt -----------------------------------------------------------
+
+
+# Tool 4: Memory Lookup
+@tool
+def memory_lookup(query: str) -> str:
+    """
+    Retrieve stored user profile memory.
+    Use this tool when the user asks about themselves:
+    - What is my name?
+    - What is my goal?
+    - What technologies do I like?
+    - What do you remember about me?
+    """
+    memory = load_memory()
+    if not memory:
+        return "No memory stored."
+    return json.dumps(memory, indent=2)
+
+# Tool 5: History Lookup
+@tool
+def history_lookup(query: str) -> str:
+    """
+    Retrieve recent conversation history.
+    Use this tool for questions like:
+    - What did we talk about?
+    - What was the last question I asked?
+    - Remind me of our recent conversation.
+    - Can you elaborate on that?
+    """
+    recent_history = get_recent_history()
+    if not recent_history:
+        return "No recent conversation history found."
+    return format_chat_history(recent_history)
+
+# Tool 6: Semantic Memory Search
+@tool
+def semantic_memory_search(query: str) -> str:
+    """
+    Search long-term semantic memory for relevant past facts.
+    Use this for questions about:
+    - Projects the user completed
+    - Courses or skills the user learned
+    - Past experiences or achievements
+    - Anything the user mentioned in previous sessions
+    """
+    results = search_semantic_memory(query, k=3)
+    if not results:
+        return "No relevant semantic memories found."
+    return "\n".join(doc.page_content for doc in results)
+
+# Tool groups (Problem 2)
+TOOL_TOOLS     = [search_tool, calculator, rag_search]
+PERSONAL_TOOLS = [search_tool, calculator, rag_search,
+                  memory_lookup, history_lookup, semantic_memory_search]
+
+# All tools (reference list)
+tools = [search_tool, calculator, rag_search]
+# ---------------------------------------------------------------------------
+# 4. ReAct Prompt
+# ---------------------------------------------------------------------------
 REACT_PROMPT = PromptTemplate.from_template(
-    """You are a helpful AI assistant that can search the web to answer questions accurately.
+"""You are an intelligent AI assistant capable of reasoning and using tools when necessary.
 
-You have access to the following tools:
+User Context: {profile_summary}
+
+Your primary objective is to answer the user's question accurately, efficiently, and with the minimum number of tool calls required.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GENERAL REASONING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. First understand the user's request.
+
+2. Determine whether a tool is actually required.
+
+3. If no tool is required, immediately produce a Final Answer without generating an Action step.
+
+4. Use tools only when they provide information that is missing, external, stored, or computational.
+
+5. Use the minimum number of tool calls necessary.
+
+6. After receiving a tool result, evaluate whether the information is sufficient to answer the question.
+
+7. If the information is incomplete, ambiguous, irrelevant, or insufficient, you MAY perform another tool call with a better query.
+
+8. Do not repeatedly call tools without a clear reason.
+
+9. Multiple tools may be used when solving the task requires information from different sources.
+
+10. Never invent tool outputs.
+
+11. Never claim to have searched, retrieved, remembered, or calculated something unless the corresponding tool was actually used.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AVAILABLE TOOLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+3. rag_search
+
+Purpose:
+Search uploaded documents using semantic retrieval.
+
+Use when:
+
+* The answer may exist in uploaded documents.
+* The user asks about company documents, reports, manuals, policies, products, pricing, support information, or internal knowledge.
+
+Examples:
+
+* What is the refund policy?
+* Summarize the revenue report.
+* What are the product prices?
+* What does the company handbook say?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4. web_search
+
+Purpose:
+Retrieve external or current information.
+
+Use when:
+
+* The question requires recent information.
+* The answer may have changed after model training.
+* External information is needed.
+
+Examples:
+
+* Latest AI news
+* Current gold price
+* Recent OpenAI announcements
+* Today's weather
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5. calculator
+
+Purpose:
+Perform mathematical calculations.
+
+Use when:
+
+* Arithmetic or numerical computation is required.
+
+Examples:
+
+* 234 * 567
+* sqrt(144)
+* 15% of 4500
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL SELECTION PRIORITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For uploaded/company documents:
+→ rag_search
+
+For recent or external information:
+→ web_search
+
+For mathematical calculations:
+→ calculator
+    
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-TOOL REASONING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use multiple tools when necessary.
+
+Example:
+
+Question:
+Compare our refund policy with industry standards.
+
+Thought:
+I need the company refund policy.
+
+Action:
+rag_search
+
+Observation:
+...
+
+Thought:
+I need industry information for comparison.
+
+Action:
+web_search
+
+Observation:
+...
+
+Thought:
+I now have enough information to compare them.
+
+Final Answer:
+...
+
+IMPORTANT:
+
+If no tool is required, do NOT output Action.
+
+Instead output:
+
+Thought: I can answer without using any tool.
+Final Answer: <your response>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL RETRY RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After every Observation:
+
+* Evaluate whether the information is sufficient.
+* If sufficient, answer the question.
+* If insufficient, ambiguous, incomplete, or irrelevant, you MAY perform another tool call.
+* Refine search queries when necessary.
+* Stop gathering information once you can answer confidently.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE FORMAT
+
+When a tool is required:
+
+Question: the user's question
+
+Thought: determine which tool is needed
+
+Action: one of [{tool_names}]
+Action Input: input for the tool
+
+Observation: result from the tool
+
+(Repeat Thought / Action / Observation if necessary)
+
+Thought: I now know the final answer
+
+Final Answer: the answer for the user
+
+
+When no tool is required:
+
+Question: the user's question
+
+Thought: I can answer without using any tool.
+
+Final Answer: the answer for the user
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AVAILABLE TOOLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 {tools}
 
-Use the following format STRICTLY:
-
-Question: the input question you must answer
-Thought: think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (you can repeat Thought/Action/Action Input/Observation if needed)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-Begin!
+Begin.
 
 Question: {input}
-Thought:{agent_scratchpad}"""
-)
 
-# -- 4. Create LangChain ReAct Agent ------------------------------------------
-#
-# LangChain ReAct agent with:
-#   - Groq LLM for lightning-fast reasoning
-#   - DuckDuckGo as the single search tool
-#   - Classic ReAct prompt pattern
-#
-agent = create_react_agent(
-    llm=llm,
-    tools=tools,
-    prompt=REACT_PROMPT,
-)
+Thought:{agent_scratchpad}
 
+
+
+
+"""
+).partial(profile_summary="")
+# ---------------------------------------------------------------------------
+# 5. Create Agent (default executor — overridden at runtime by get_executor)
+# ---------------------------------------------------------------------------
+agent = create_react_agent(llm=llm, tools=tools, prompt=REACT_PROMPT)
 agent_executor = AgentExecutor(
     agent=agent,
     tools=tools,
-    verbose=True,            # shows Thought / Action / Observation live
+    verbose=True,
     handle_parsing_errors=True,
-    max_iterations=5,        # safety cap
+    max_iterations=6,
     return_intermediate_steps=False,
 )
 
-# -- 5. Run function -----------------------------------------------------------
+def get_executor(tools_list):
+    """Dynamically creates AgentExecutor with given tools (Problem 2)."""
+    _agent = create_react_agent(llm=llm, tools=tools_list, prompt=REACT_PROMPT)
+    return AgentExecutor(
+        agent=_agent,
+        tools=tools_list,
+        verbose=True,
+        handle_parsing_errors=True,
+        max_iterations=6,
+        return_intermediate_steps=False,
+    )
+
+def update_memory(message: str):
+    """Gate wrapper: runs profile + semantic memory update (Problems 3 & 4)."""
+    update_memories(message)
+
+def should_store_semantic_memory(message: str):
+    """Gate wrapper: semantic storage already handled inside update_memories (Problems 3 & 4)."""
+    pass
+
+def profile_summary() -> str:
+    """Returns a single compressed user context line — never full JSON (Problem 6)."""
+    memory = load_memory()
+    if not memory:
+        return ""
+    name      = memory.get("name", "")
+    goal      = memory.get("goal", "")
+    interests = memory.get("interests", [])
+    if isinstance(interests, list):
+        interests = ", ".join(interests)
+    return f"User: {name} | Goal: {goal} | Likes: {interests}"
+
+# ---------------------------------------------------------------------------
+# 6. Ask function
+# ---------------------------------------------------------------------------
+
 def ask(question: str) -> str:
-    """
-    Run the single-tool agent pipeline:
-        Question -> Agent -> Web Search -> LLM -> Answer
-
-    Args:
-        question: The question to answer.
-
-    Returns:
-        The agent's final answer as a string.
-    """
-    print("\n" + "=" * 60)
+    """Run the multi-tool agent with intent-based routing."""
+    print("=" * 60)
     print(f"  Question : {question}")
     print("=" * 60)
 
-    result = agent_executor.invoke({"input": question})
-    answer = result.get("output", "No answer returned.")
+    intent = classify_intent(question)
+    print(f"  Intent   : {intent}")
 
-    print("\n" + "-" * 60)
+    # Path 1 — simple: no tools, no memory
+    if intent == "simple":
+        answer = llm.invoke(question).content
+        update_chat_history(question, answer)
+        return answer
+
+    # Path 2 — memory: user sharing personal info
+    if intent == "memory":
+        update_memory(question)
+        should_store_semantic_memory(question)
+        answer = llm.invoke(question).content
+        update_chat_history(question, answer)
+        return answer
+
+    # Path 3 — tool: needs tools, no personal context injected
+    if intent == "tool":
+        executor = get_executor(TOOL_TOOLS)
+        try:
+            result = executor.invoke({"input": question})
+            answer = result.get("output", "No answer returned.")
+        except Exception as e:
+            print(f"Agent error: {e}")
+            answer = "I ran into an issue processing your request. Please try again."
+        update_chat_history(question, answer)
+        return answer
+
+    # Path 4 — personal_tool: needs tools + user context
+    update_memory(question)
+    should_store_semantic_memory(question)
+    executor = get_executor(PERSONAL_TOOLS)
+    try:
+        result = executor.invoke({
+            "input": question,
+            "profile_summary": profile_summary()
+        })
+        answer = result.get("output", "No answer returned.")
+    except Exception as e:
+        print(f"Agent error: {e}")
+        answer = "I ran into an issue processing your request. Please try again."
+
+    update_chat_history(question, answer)
+    print("-" * 60)
     print(f"  Answer   : {answer}")
-    print("-" * 60 + "\n")
-
+    print("-" * 60)
     return answer
-
-
-# -- 6. CLI Entry Point --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 7. CLI Entry Point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-
     if len(sys.argv) > 1:
-        # Single question via CLI arg
-        # e.g.  python agent.py "What is the latest news on AI?"
-        question = " ".join(sys.argv[1:])
-        ask(question)
+        ask(" ".join(sys.argv[1:]))
     else:
-        # Interactive chat loop
-        print("\nSingle Tool Agent  --  Powered by Groq + DuckDuckGo")
-        print("Type your question or 'quit' to exit.\n")
+        # print("\nMulti Tool Agent  --  Groq + DuckDuckGo + Calculator + RAG (FAISS)")
+        # print("Tools: web_search | calculator | rag_search")
+        # print(f"Documents folder: {DOCS_DIR.resolve()}")
+        # print("Type your question or 'quit' to exit.\n")
         while True:
             try:
                 q = input("You: ").strip()
